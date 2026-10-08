@@ -51,6 +51,7 @@ EOD_ANCHOR_ID = os.environ.get("EOD_ANCHOR_ID", "EODAnchor")
 # 4:50pm ET, 9 minutes of margin ahead of that close, not sitting on top of it.
 ENTRY_CUTOFF_ET = os.environ.get("ENTRY_CUTOFF_ET", "16:50")
 ENTRY_CUTOFF_TZ = os.environ.get("ENTRY_CUTOFF_TZ", "America/New_York")
+ENTRY_RESUME_ET = os.environ.get("ENTRY_RESUME_ET", "18:00")
 
 LOG = pathlib.Path(os.environ.get("LOG_PATH", "decisions.csv"))
 
@@ -104,8 +105,10 @@ def contract_cap(day_pnl):
 def past_entry_cutoff():
     now_et = datetime.datetime.now(ZoneInfo(ENTRY_CUTOFF_TZ))
     cutoff_h, cutoff_m = (int(x) for x in ENTRY_CUTOFF_ET.split(":"))
+    resume_h, resume_m = (int(x) for x in ENTRY_RESUME_ET.split(":"))
     cutoff = now_et.replace(hour=cutoff_h, minute=cutoff_m, second=0, microsecond=0)
-    return now_et >= cutoff
+    resume = now_et.replace(hour=resume_h, minute=resume_m, second=0, microsecond=0)
+    return cutoff <= now_et < resume
 
 def evaluate(equity, qty_in):
     """Returns (decision, qty_out, reason, floor, day_pnl, buffer_pct)."""
