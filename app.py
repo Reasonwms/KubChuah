@@ -49,9 +49,9 @@ EOD_ANCHOR_ID = os.environ.get("EOD_ANCHOR_ID", "EODAnchor")
 # Entry cutoff: "HH:MM" in the given timezone. No new entries at/after this.
 # Legends Trading requires positions closed by ~4:59pm ET. Default here is
 # 4:50pm ET, 9 minutes of margin ahead of that close, not sitting on top of it.
-ENTRY_CUTOFF_ET = os.environ.get("ENTRY_CUTOFF_ET", "18:00")
+ENTRY_CUTOFF_ET = os.environ.get("ENTRY_CUTOFF_ET", "16:50"
 ENTRY_CUTOFF_TZ = os.environ.get("ENTRY_CUTOFF_TZ", "America/New_York")
-ENTRY_RESUME_ET = os.environ.get("ENTRY_RESUME_ET", "18:00")
+
 LOG = pathlib.Path(os.environ.get("LOG_PATH", "decisions.csv"))
 
 # position ladder: (min_day_pnl, max_day_pnl, cap) — keyed off TODAY's P&L
@@ -101,7 +101,8 @@ def contract_cap(day_pnl):
             return cap
     return 5  # below $0 for the day (or any unmatched value): smallest tier
 
-ENTRY_RESUME_ET = os.environ.get("ENTRY_RESUME_ET", "18:00")    now_et = datetime.datetime.now(ZoneInfo(ENTRY_CUTOFF_TZ))
+def past_entry_cutoff():
+    now_et = datetime.datetime.now(ZoneInfo(ENTRY_CUTOFF_TZ))
     cutoff_h, cutoff_m = (int(x) for x in ENTRY_CUTOFF_ET.split(":"))
     cutoff = now_et.replace(hour=cutoff_h, minute=cutoff_m, second=0, microsecond=0)
     return now_et >= cutoff
