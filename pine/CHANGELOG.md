@@ -1,5 +1,20 @@
 # Pine Script Change Log — CDO Consulting LLC / ATI Division
 
+## TPO + VIDYA Short — `tpo_vidya_short_v1.1.pine`
+
+### v1.1 — 2026-10-18 — set to confirmed 50K Apprentice rules
+
+Confirmed rules: max 2 contracts / 20 micros, $3,000 target, $2,000 EOD trailing max loss,
+no consistency rule, pass in 1 day.
+
+| Change | Why | Expected effect | How to measure |
+|---|---|---|---|
+| Drawdown breach check uses **worst-case equity inside the bar** (the bar high for a short), not the bar-close equity. | With EOD trailing, the floor only moves at end of day, but a breach counts in real time. v1.0 could miss a breach that happened inside a bar and then recovered by the close. | Fewer fake "passes". The pass rate goes down a little but is closer to live. | Compare "Evals failed" for v1.0 vs v1.1 on the same chart and dates. |
+| `Trailing floor stops at start balance` now **OFF** by default. | The firm has not confirmed a floor lock. OFF is the stricter case. | The backtest will not overstate your room after a +$2k day. | If the firm confirms a lock, turn it ON and compare the pass rate. |
+| New input `Min trading days to pass` (default 1). | Matches "pass in 1 day". You can reuse it for firms that require 5 or 7 days. | No change at 1 day. | Average days to pass stays at 1 or more. |
+| Daily loss cap tooltip now says it is **your** KubChuah limit, not a firm rule. | The 50K Apprentice has no daily loss limit. The $600 cap stays as your own risk rule. | None (wording only). | — |
+| Consistency stays OFF (0). | No consistency rule. | — | — |
+
 ## TPO + VIDYA Short — `tpo_vidya_short_v1.0.pine`
 
 ### v1.0 — 2026-10-18 — first build

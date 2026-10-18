@@ -1,0 +1,351 @@
+//@version=6
+// ============================================================================
+// Two-Pole Oscillator + VIDYA — Short Strategy            v1.1
+// CDO Consulting LLC — ATI Division  |  Marwan Williams
+// Built for: 50K Apprentice evaluation — max 2 minis / 20 micros
+// Rules: $3,000 target | $2,000 EOD trailing max loss | no consistency | 1-day pass
+// Market: MNQ (micro) or NQ (mini)  |  Suggested chart: 5m
+// ----------------------------------------------------------------------------
+// ENTRY (short only, on bar close, fills next bar open):
+//   1. Two-Pole Oscillator crosses DOWN through its lagged copy
+//   2. ...while the oscillator is above the "min level" (stretched up)
+//   3. Close is below VIDYA and VIDYA is falling (down trend)
+//   4. Inside the ET entry window, flat, and all prop-rule gates pass
+// EXIT: ATR stop, R-multiple target, optional breakeven, opposite TPO cross,
+//       close back above VIDYA, forced flatten before the session close.
+// SIZE: risk-based (USD per trade / stop in USD), capped by contract max
+//       and (optional) by the KubChuah gate ladder in app.py (5/10/20 micros).
+// ----------------------------------------------------------------------------
+// No request.security(), no future bars, all logic on confirmed bar close
+// -> no repainting, no look-ahead. Change log: pine/CHANGELOG.md
+// ============================================================================
+strategy("TPO + VIDYA Short v1.1 [CDO]", shorttitle="TPO-VIDYA S", overlay=true,
+     initial_capital=50000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.62,
+     slippage=1, pyramiding=0, process_orders_on_close=false,
+     calc_on_every_tick=false, max_bars_back=500)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+tpoLen      = input.int(25, minval=5,  title="Normalize Length",         group="① Two-Pole Oscillator")
+tpoFilt     = input.int(20, minval=2,  title="Two-Pole Filter Length",   group="① Two-Pole Oscillator")
+tpoLag      = input.int(4,  minval=1,  maxval=20, title="Signal Lag (bars)", group="① Two-Pole Oscillator")
+tpoMinLevel = input.float(0.0, step=0.1, title="Sell only when osc above", group="① Two-Pole Oscillator",
+     tooltip="0 = sell crosses in the upper half only. Raise to 0.5+ for stronger overbought.")
+
+vidLen      = input.int(20, minval=2, title="VIDYA Length",          group="② VIDYA Trend")
+vidMom      = input.int(9,  minval=2, title="VIDYA CMO Length",      group="② VIDYA Trend")
+reqBelow    = input.bool(true,  title="Require close below VIDYA",   group="② VIDYA Trend")
+reqSlope    = input.bool(true,  title="Require VIDYA falling",       group="② VIDYA Trend")
+
+atrLen      = input.int(14, minval=1,              title="ATR Length",            group="③ Risk & Size")
+slMult      = input.float(1.5, minval=0.1, step=0.1, title="Stop = ATR x",        group="③ Risk & Size")
+rrTarget    = input.float(2.0, minval=0.5, step=0.1, title="Target = R x",        group="③ Risk & Size")
+riskUsd     = input.float(200, minval=10, step=10,   title="Risk per trade (USD)", group="③ Risk & Size",
+     tooltip="Trade is skipped if 1 contract already risks more than this.")
+maxMini     = input.int(2,  minval=1, maxval=2,  title="Max minis (NQ)",    group="③ Risk & Size")
+maxMicro    = input.int(20, minval=1, maxval=20, title="Max micros (MNQ)",  group="③ Risk & Size")
+useLadder   = input.bool(true, title="Mirror KubChuah gate ladder (5/10/20 micros by day P&L)", group="③ Risk & Size")
+useBE       = input.bool(false, title="Move stop to breakeven",        group="③ Risk & Size")
+beAtR       = input.float(1.0, minval=0.2, step=0.1, title="Breakeven at R", group="③ Risk & Size")
+
+exitOnTpo   = input.bool(true, title="Exit on TPO buy cross",         group="④ Signal Exits")
+exitOnVid   = input.bool(true, title="Exit on close above VIDYA",     group="④ Signal Exits")
+
+entrySess   = input.session("0935-1530", title="Entry window (ET)",   group="⑤ Session (New York time)")
+flatHour    = input.int(16, minval=0, maxval=23, title="Flatten hour (ET)",   group="⑤ Session (New York time)")
+flatMin     = input.int(30, minval=0, maxval=59, title="Flatten minute (ET)", group="⑤ Session (New York time)",
+     tooltip="Order fills at the NEXT bar open. Keep a margin before the firm's close.")
+maxTrades   = input.int(3, minval=1, title="Max trades per day",      group="⑤ Session (New York time)")
+
+profitTgt   = input.float(3000, minval=100, step=100, title="Profit target (USD)",     group="⑥ Prop Eval Rules")
+ddAmount    = input.float(2000, minval=100, step=100, title="Max drawdown (USD)",      group="⑥ Prop Eval Rules")
+ddType      = input.string("EOD trailing", options=["EOD trailing", "Intraday trailing", "Static"], title="Drawdown type", group="⑥ Prop Eval Rules")
+lockAtStart = input.bool(false, title="Trailing floor stops at start balance", group="⑥ Prop Eval Rules",
+     tooltip="OFF = floor keeps trailing (stricter). Turn ON only if the firm confirms a lock.")
+minDays     = input.int(1, minval=1, title="Min trading days to pass", group="⑥ Prop Eval Rules")
+dailyCap    = input.float(600, minval=0, step=50, title="Daily loss cap (USD, 0 = off)", group="⑥ Prop Eval Rules",
+     tooltip="Your own KubChuah limit (DAILY_CAP_AMOUNT in app.py). Not a firm rule — the 50K Apprentice has none.")
+haircutPct  = input.float(20, minval=0, maxval=90, title="Gate haircut % of drawdown", group="⑥ Prop Eval Rules",
+     tooltip="Matches HAIRCUT_PCT in app.py. Blocks entries before the hard floor.")
+consistPct  = input.float(0, minval=0, maxval=100, title="Consistency: best day max % (0 = off)", group="⑥ Prop Eval Rules")
+haltOnRes   = input.bool(false, title="Stop backtest at first pass/fail", group="⑥ Prop Eval Rules",
+     tooltip="OFF = keep running and count every simulated eval (pass rate).")
+
+entryId     = input.string("TPV_Short", title="Entry order_id",      group="⑦ Alerts (KubChuah gate)")
+exitId      = input.string("TPV_Exit",  title="Exit order_id",       group="⑦ Alerts (KubChuah gate)")
+qtyField    = input.string("quantity",  title="Qty field name",      group="⑦ Alerts (KubChuah gate)",
+     tooltip="Must match QTY_FIELD in the Railway env.")
+sendAnchor  = input.bool(true, title="Send daily EOD anchor alert",  group="⑦ Alerts (KubChuah gate)")
+anchorId    = input.string("EODAnchor", title="EOD anchor order_id", group="⑦ Alerts (KubChuah gate)")
+
+showDash    = input.bool(true, title="Show dashboard", group="⑧ Display")
+
+// ── Dashboard helpers — MUST be at global scope ─────────────────────────────
+var table dash = na
+
+dashUsd(v) =>
+    (v >= 0 ? "+" : "-") + "USD " + str.tostring(math.round(math.abs(v)), "0")
+
+dashPct(v) =>
+    str.tostring(math.round(v * 10) / 10, "0.0") + "%"
+
+dashDec(v) =>
+    str.tostring(math.round(v * 100) / 100, "0.00")
+
+dashRow(r, lbl, val, tgt, vc) =>
+    table.cell(dash, 0, r, lbl, text_color=color.new(color.silver, 0),  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r, val, text_color=vc,                           text_size=size.small, text_halign=text.align_right)
+    table.cell(dash, 2, r, tgt, text_color=color.new(color.silver, 45), text_size=size.small, text_halign=text.align_right)
+
+dashHead(r, a, b, c) =>
+    hc = color.new(#111827, 0)
+    tc = color.new(color.silver, 0)
+    table.cell(dash, 0, r, a, text_color=tc, text_size=size.small, bgcolor=hc, text_halign=text.align_left)
+    table.cell(dash, 1, r, b, text_color=tc, text_size=size.small, bgcolor=hc, text_halign=text.align_right)
+    table.cell(dash, 2, r, c, text_color=tc, text_size=size.small, bgcolor=hc, text_halign=text.align_right)
+
+// ── Two-Pole Oscillator ─────────────────────────────────────────────────────
+// Normalized distance from SMA, smoothed by two stacked EMAs (a two-pole filter).
+twoPole(src, len) =>
+    alpha = 2.0 / (len + 1)
+    var float s1 = na
+    var float s2 = na
+    if not na(src)
+        s1 := na(s1) ? src : (1 - alpha) * s1 + alpha * src
+        s2 := na(s2) ? s1  : (1 - alpha) * s2 + alpha * s1
+    s2
+
+dev     = close - ta.sma(close, tpoLen)
+devSd   = ta.stdev(dev, tpoLen)
+devNorm = devSd > 0 ? (dev - ta.sma(dev, tpoLen)) / devSd : na
+tpo     = twoPole(devNorm, tpoFilt)
+tpoSig  = tpo[tpoLag]
+
+tpoSell = ta.crossunder(tpo, tpoSig) and tpo > tpoMinLevel
+tpoBuy  = ta.crossover(tpo, tpoSig)
+
+// ── VIDYA (Chande) ──────────────────────────────────────────────────────────
+// EMA whose speed scales with the absolute Chande Momentum Oscillator.
+vidyaCalc(src, len, momLen) =>
+    mom   = ta.change(src)
+    up    = math.sum(math.max(mom, 0), momLen)
+    dn    = math.sum(-math.min(mom, 0), momLen)
+    cmo   = nz(up + dn == 0 ? 0.0 : math.abs((up - dn) / (up + dn)))
+    alpha = 2.0 / (len + 1)
+    var float v = na
+    v := na(v) ? src : alpha * cmo * src + (1 - alpha * cmo) * v
+    v
+
+vidya      = vidyaCalc(close, vidLen, vidMom)
+vidFalling = vidya < vidya[1]
+bearTrend  = (not reqBelow or close < vidya) and (not reqSlope or vidFalling)
+
+// ── Size ────────────────────────────────────────────────────────────────────
+atr      = ta.atr(atrLen)
+stopDist = atr * slMult
+pv       = syminfo.pointvalue
+isMini   = pv >= 20                       // NQ = 20, MNQ = 2
+hardCap  = isMini ? maxMini : maxMicro
+
+// Same tiers as LADDER in app.py, keyed off today's P&L (in micros).
+ladderMicros(dpnl) =>
+    dpnl >= 2000 ? 20 : dpnl >= 1000 ? 10 : 5
+
+// ── Session clock (New York) ────────────────────────────────────────────────
+etMins      = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+flatMins    = flatHour * 60 + flatMin
+pastFlatten = etMins >= flatMins and etMins < 18 * 60    // 18:00 ET = new futures session
+inWindow    = not na(time(timeframe.period, entrySess, "America/New_York"))
+newDay      = timeframe.change("D")
+
+// ── Day + eval state ────────────────────────────────────────────────────────
+var float dayStartEq = strategy.initial_capital
+var int   tradesToday = 0
+var bool  dayLocked   = false
+var bool  anchorSent  = false
+
+var float evBase      = strategy.initial_capital
+var float evHwm       = strategy.initial_capital
+var float attBestDay  = 0.0
+var int   evDays      = 0
+var int   evPass      = 0
+var int   evFail      = 0
+var int   sumPassDays = 0
+var bool  evPending   = false     // result hit; new attempt starts next day
+var bool  evHalt      = false
+var string evFirst    = "ACTIVE"
+
+if newDay
+    prevDay = strategy.equity - dayStartEq
+    if not evPending
+        attBestDay := math.max(attBestDay, prevDay)
+        evDays += 1
+    if evPending and not evHalt
+        evBase     := strategy.equity
+        evHwm      := strategy.equity
+        attBestDay := 0.0
+        evDays     := 0
+        evPending  := false
+    else if ddType == "EOD trailing"
+        evHwm := math.max(evHwm, strategy.equity)
+    dayStartEq  := strategy.equity
+    tradesToday := 0
+    dayLocked   := false
+    anchorSent  := false
+
+if ddType == "Intraday trailing" and not evPending
+    evHwm := math.max(evHwm, strategy.equity)   // bar-close resolution only
+
+evFloor = ddType == "Static" ? evBase - ddAmount : lockAtStart ? math.min(evHwm - ddAmount, evBase) : evHwm - ddAmount
+evPnl   = strategy.equity - evBase
+dayPnl  = strategy.equity - dayStartEq
+
+if dailyCap > 0 and dayPnl <= -dailyCap
+    dayLocked := true
+
+haircutBlock = strategy.equity <= evFloor + ddAmount * haircutPct / 100
+
+// ── Alert payloads (JSON for the KubChuah gate) ─────────────────────────────
+exitMsg = '{"order_id":"' + exitId + '","symbol":"' + syminfo.ticker + '","action":"close","equity":' + str.tostring(strategy.equity, "#.##") + '}'
+
+// ── Eval result check ───────────────────────────────────────────────────────
+// Worst-case equity inside the bar: for a short, the bar high is the worst price.
+// The EOD floor only MOVES at end of day, but a breach counts in real time.
+worstEq = strategy.position_size < 0 ? strategy.initial_capital + strategy.netprofit + (strategy.position_avg_price - high) * math.abs(strategy.position_size) * syminfo.pointvalue : strategy.equity
+bestInclToday = math.max(attBestDay, dayPnl)
+consistOK     = consistPct <= 0 or (evPnl > 0 and bestInclToday / evPnl * 100 <= consistPct)
+dateStr       = str.format_time(time, "yyyy-MM-dd", "America/New_York")
+
+if not evHalt and not evPending
+    if worstEq <= evFloor
+        evFail += 1
+        if evFirst == "ACTIVE"
+            evFirst := "FAILED " + dateStr
+        strategy.close_all(comment="DD Breach", alert_message=exitMsg)
+        evPending := true
+        evHalt    := haltOnRes
+    else if evPnl >= profitTgt and strategy.position_size == 0 and consistOK and evDays + 1 >= minDays
+        evPass      += 1
+        sumPassDays += evDays + 1
+        if evFirst == "ACTIVE"
+            evFirst := "PASSED " + dateStr
+        evPending := true
+        evHalt    := haltOnRes
+
+// ── Conditions ──────────────────────────────────────────────────────────────
+sizeCapRaw = useLadder ? (isMini ? math.max(1, math.floor(ladderMicros(dayPnl) / 10.0)) : ladderMicros(dayPnl)) : hardCap
+sizeCap    = math.min(sizeCapRaw, hardCap)
+riskQty    = stopDist > 0 ? math.floor(riskUsd / (stopDist * pv)) : 0
+qty        = math.min(riskQty, sizeCap)
+
+shortSignal = tpoSell and bearTrend and inWindow
+canTrade    = strategy.position_size == 0 and not evHalt and not evPending and not dayLocked
+              and not haircutBlock and not pastFlatten and tradesToday < maxTrades
+shortOK     = shortSignal and canTrade and qty >= 1
+
+// ── Entries + bracket ───────────────────────────────────────────────────────
+var float activeSL = na
+var float activeTP = na
+var float entryRef = na
+var float riskPts  = na
+var bool  beDone   = false
+
+inShort    = strategy.position_size < 0
+justOpened = inShort and strategy.position_size[1] >= 0
+
+// Re-anchor stop/target to the real fill price once the entry has filled.
+if justOpened
+    entryRef := strategy.position_avg_price
+    activeSL := entryRef + riskPts
+    activeTP := entryRef - riskPts * rrTarget
+
+if inShort and useBE and not beDone and low <= entryRef - riskPts * beAtR
+    activeSL := entryRef
+    beDone   := true
+
+if shortOK
+    entryRef := close
+    riskPts  := stopDist
+    activeSL := close + stopDist
+    activeTP := close - stopDist * rrTarget
+    beDone   := false
+    tradesToday += 1
+    entryMsg = '{"order_id":"' + entryId + '","symbol":"' + syminfo.ticker + '","action":"sell","' + qtyField + '":' + str.tostring(qty)
+         + ',"equity":' + str.tostring(strategy.equity, "#.##")
+         + ',"sl":' + str.tostring(activeSL, format.mintick) + ',"tp":' + str.tostring(activeTP, format.mintick) + '}'
+    strategy.entry("Short", strategy.short, qty=qty, comment="TPO Sell", alert_message=entryMsg)
+
+if inShort or shortOK
+    strategy.exit("Short Exit", from_entry="Short", stop=activeSL, limit=activeTP,
+         comment_loss="SL", comment_profit="TP", alert_message=exitMsg)
+
+// ── Signal exits ────────────────────────────────────────────────────────────
+if inShort and exitOnTpo and tpoBuy
+    strategy.close("Short", comment="TPO Buy", alert_message=exitMsg)
+if inShort and exitOnVid and close > vidya
+    strategy.close("Short", comment="VIDYA Reclaim", alert_message=exitMsg)
+if inShort and pastFlatten
+    strategy.close_all(comment="EOD Flatten", alert_message=exitMsg)
+
+// ── EOD anchor alert (once per day, after flatten, when flat) ───────────────
+if sendAnchor and pastFlatten and strategy.position_size == 0 and not anchorSent
+    alert('{"order_id":"' + anchorId + '","equity":' + str.tostring(strategy.equity, "#.##") + '}', alert.freq_once_per_bar_close)
+    anchorSent := true
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(vidya, color=vidFalling ? color.new(color.red, 0) : color.new(color.teal, 0), linewidth=2, title="VIDYA")
+plotshape(shortOK, style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.small, title="Short Entry")
+plotshape(shortSignal and not shortOK, style=shape.xcross, location=location.abovebar, color=color.new(color.gray, 30), size=size.tiny, title="Signal Blocked")
+plot(inShort ? activeSL : na, color=color.new(color.red, 20),  style=plot.style_linebr, linewidth=1, title="SL")
+plot(inShort ? activeTP : na, color=color.new(color.lime, 20), style=plot.style_linebr, linewidth=1, title="TP")
+bgcolor(dayLocked or evPending ? color.new(color.gray, 92) : na, title="Entries blocked")
+
+// ── Strategy Report + Prop Eval Dashboard ───────────────────────────────────
+if showDash and barstate.islast
+    tot  = strategy.closedtrades
+    wins = strategy.wintrades
+    loss = strategy.losstrades
+    np   = strategy.netprofit
+    gp   = strategy.grossprofit
+    gl   = strategy.grossloss
+    dd   = strategy.max_drawdown
+    wr   = tot  > 0  ? wins * 100.0 / tot : 0.0
+    pf   = gl   != 0 ? math.abs(gp / gl)  : 0.0
+    aw   = wins > 0  ? gp / wins          : 0.0
+    al   = loss > 0  ? gl / loss          : 0.0
+    rr   = al   != 0 ? math.abs(aw / al)  : 0.0
+    evN  = evPass + evFail
+    pr   = evN > 0 ? evPass * 100.0 / evN : 0.0
+    apd  = evPass > 0 ? sumPassDays * 1.0 / evPass : 0.0
+    buf  = strategy.equity - evFloor
+
+    dash := table.new(position.bottom_right, 3, 20,
+         bgcolor=color.new(color.black, 55), border_color=color.new(color.gray, 50),
+         border_width=1, frame_color=color.new(color.gray, 30), frame_width=1)
+
+    cG = color.new(color.lime, 0)
+    cR = color.new(color.red, 0)
+    cY = color.new(color.yellow, 0)
+
+    dashHead(0, "STRATEGY REPORT", "VALUE", "TARGET")
+    dashRow(1,  "Net Profit",    dashUsd(np),           "> 0",     np  >= 0   ? cG : cR)
+    dashRow(2,  "Total Trades",  str.tostring(tot),     "> 30",    tot >= 30  ? cG : cR)
+    dashRow(3,  "Win Rate",      dashPct(wr),           "> 40%",   wr  >= 40  ? cG : cR)
+    dashRow(4,  "Profit Factor", dashDec(pf),           "> 1.5",   pf  >= 1.5 ? cG : cR)
+    dashRow(5,  "Avg Win",       dashUsd(aw),           "---",     cG)
+    dashRow(6,  "Avg Loss",      dashUsd(-al),          "---",     cR)
+    dashRow(7,  "Achieved RR",   dashDec(rr) + ":1",    "> 1.5:1", rr  >= 1.5 ? cG : cR)
+    dashRow(8,  "Max DD",        dashUsd(-math.abs(dd)), "< " + dashUsd(ddAmount), math.abs(dd) < ddAmount ? cG : cR)
+
+    dashHead(9, "50K APPRENTICE", "VALUE", "RULE")
+    dashRow(10, "First result",   evFirst, "---", str.startswith(evFirst, "PASSED") ? cG : str.startswith(evFirst, "FAILED") ? cR : cY)
+    dashRow(11, "Evals passed",   str.tostring(evPass), "---", cG)
+    dashRow(12, "Evals failed",   str.tostring(evFail), "---", evFail > 0 ? cR : cG)
+    dashRow(13, "Pass rate",      dashPct(pr), "> 50%", pr >= 50 ? cG : cR)
+    dashRow(14, "Avg days to pass", dashDec(apd), "---", cY)
+    dashRow(15, "Attempt P&L",    dashUsd(evPnl), dashUsd(profitTgt), evPnl >= 0 ? cG : cR)
+    dashRow(16, "DD floor",       "USD " + str.tostring(math.round(evFloor), "0"), ddType, cY)
+    dashRow(17, "Buffer to floor", dashUsd(buf), "> " + dashUsd(ddAmount * haircutPct / 100), buf > ddAmount * haircutPct / 100 ? cG : cR)
+    dashRow(18, "Today P&L",      dashUsd(dayPnl), dailyCap > 0 ? "> " + dashUsd(-dailyCap) : "off", dayLocked ? cR : cG)
+    dashRow(19, "Size cap now",   str.tostring(sizeCap) + (isMini ? " NQ" : " MNQ"), "max " + str.tostring(hardCap), cY)
