@@ -3,7 +3,7 @@ CDO Consulting LLC · Automated Trading Infrastructure
 
 One customer = one Railway service, one set of facts, one Manifest.
 
-Code these instructions were checked against: `app.py` (v2, EOD-trailing gate) on the `main` branch at commit `2e7a368`. If `app.py` has changed since then, re-run the Part B pre-check before you trust anything in the "Code facts" section.
+Code these instructions were checked against: `app.py` v3 (adds `DD_MODE` and `LADDER_CONFIG`) on branch `claude/sleepy-albattani-g7k9p4`. Until that branch is merged and deployed, the live gate is still v2 (EOD trail only, fixed 5/10/20 ladder). If `app.py` has changed since then, re-run the Part B pre-check before you trust anything in the "Code facts" section.
 
 ---
 
@@ -28,16 +28,16 @@ If any item is missing, report Blocked and stop.
 6. **Firm facts:** firm name, eval or funded, starting balance, profit target, max drawdown ($), drawdown type (intraday trail / EOD trail / static), trail lock level, daily loss limit, consistency %, max contracts, must-be-flat time, overnight allowed?, news rules, and the firm's written OK on automation (with date).
 7. **Strategy facts:** strategy name, entry order IDs (exact case), exit order IDs (must be different from entry IDs), contract and symbol, point value, trading hours.
 8. **PickMyTrade facts:** the exact key for contract count, the exact key for order ID, and whether an account ID is present.
-9. **Gate settings** (Marwan proposes, customer signs): HAIRCUT_PCT, DAILY_CAP_AMOUNT, ENTRY_CUTOFF_ET (about 9 minutes before flat time), ENTRY_RESUME_ET, MAX_EQUITY_DRIFT, news blackout on/off and window.
+9. **Gate settings** (Marwan proposes, customer signs): DD_MODE, TRAIL_LOCK_BALANCE, LADDER_CONFIG, LADDER_BASIS, HAIRCUT_PCT, DAILY_CAP_AMOUNT, ENTRY_CUTOFF_ET (about 9 minutes before flat time), ENTRY_RESUME_ET, MAX_EQUITY_DRIFT, news blackout on/off and window.
 
 **Cowork checks — any "yes" = Blocked:**
 - Any field blank or "unknown". Never fill a field from another customer, an old plan, or a guess.
 - Entry IDs and exit IDs overlap.
 - Any entry or exit ID equals `EODAnchor` (the gate reserves that ID).
-- Trail lock is missing.
-- Drawdown type is not EOD trail (see Code facts — the current code handles EOD trail only).
+- Trail lock is missing (write "none" if the firm has no lock — blank is not allowed).
+- Drawdown type is not one of: intraday trail, EOD trail, static.
 - DAILY_CAP_AMOUNT is higher than the firm's daily loss limit (if the firm has one).
-- The firm's max contracts is lower than what the gate's size ladder allows (see Code facts), unless Marwan approves in writing.
+- The last cap in LADDER_CONFIG is higher than the firm's max contracts.
 - No written OK on automation from the firm.
 
 ---
@@ -51,7 +51,7 @@ If any item is missing, report Blocked and stop.
     - `MAX_EQUITY_DRIFT` check
     - News blackout
 
-    As of commit `2e7a368`, all six are **NOT BUILT**. Only customers whose firm uses EOD trailing drawdown can be served.
+    As of v3: `DD_MODE` and `LADDER_CONFIG` are **Built**. The other four are **NOT BUILT**. If the deployed service is still v2, report all six NOT BUILT and serve EOD-trail firms only.
 11. Create a new Railway service for this customer. Paid plan. Start command uses exactly 1 worker: `gunicorn app:app --workers 1` (already set in `railway.json` and `Procfile` — confirm it was not changed).
 12. Add a volume at `/data`. Set `LOG_PATH=/data/decisions.csv`. Also set `STATE_PATH=/data/state.json` so it is ready, but mark it "not read by code" in the Manifest until state persistence is built.
 13. Set the non-secret Railway variables from this customer's Part A facts only. Use the variable table in Code facts. **Set every variable explicitly, even ones with a code default** — the defaults were written for one Legends Trading account, not for this customer.
@@ -60,6 +60,7 @@ If any item is missing, report Blocked and stop.
     - `SECRET_PATH` (the webhook secret path — a long random string)
     - `PMT_WEBHOOK_URL` and the PickMyTrade token / account ID inside the customer's JSON
 15. **Variable Manifest.** One page, three columns per setting: customer fact | Railway value | code/config value. Secrets show "present / missing" only.
+    - Map the firm facts like this: drawdown type intraday trail → `DD_MODE=intraday_trail`, EOD trail → `eod_trail`, static → `static`. Trail lock level → `TRAIL_LOCK_BALANCE` (blank if "none"). Max drawdown → `DD_AMOUNT`. Starting balance → `START_BALANCE`. Max contracts ≥ last cap in `LADDER_CONFIG`.
     - Include every variable in the Code facts table, plus every Part A fact that has no variable (mark those "manual rule — not enforced by gate").
     - Customer signs it. Marwan signs it.
     - No tests and no go-live without both signatures and all three columns matching.
@@ -105,7 +106,7 @@ Write the results to the report. **Stop here.** Go-live needs Marwan's and the c
 
 ---
 
-## Code facts (app.py at `2e7a368`)
+## Code facts (app.py v3)
 
 Use these when you fill the Manifest's "code/config value" column.
 
@@ -128,22 +129,31 @@ Use these when you fill the Manifest's "code/config value" column.
 | `ENTRY_CUTOFF_ET` | Set it | `16:50` | No new entries from this time |
 | `ENTRY_RESUME_ET` | Set it | `18:00` | Entries allowed again from this time |
 | `ENTRY_CUTOFF_TZ` | Set it | `America/New_York` | Time zone for cutoff/resume |
+| `DD_MODE` | Set it | `eod_trail` | `eod_trail`, `intraday_trail` or `static`. Anything else = service won't start |
+| `TRAIL_LOCK_BALANCE` | Set it if firm locks | blank (no lock) | Trailing floor never rises above this balance. Ignored for `static` |
+| `LADDER_CONFIG` | Set it | `0:5,1000:10,2000:20` | `threshold:cap` tiers, ascending. Bad format = service won't start |
+| `LADDER_BASIS` | Set it | `day` | `day` = P&L since today's anchor; `total` = equity − START_BALANCE |
 | `LOG_PATH` | Set it | `decisions.csv` (lost on redeploy) | Decision log — also the gate's memory |
 | `STATE_PATH` | Not read | — | Reserved for Rev 7 state file |
-| `MAX_EQUITY_DRIFT`, `DD_MODE`, `LADDER_CONFIG`, news blackout | Not read | — | NOT BUILT — manual rules only |
+| `MAX_EQUITY_DRIFT`, news blackout | Not read | — | NOT BUILT — manual rules only |
 
 ### How the gate behaves
-- **Drawdown:** EOD trail only. Floor = highest anchor − `DD_AMOUNT`. Entries are blocked at highest anchor − `DD_AMOUNT` × (1 − `HAIRCUT_PCT`/100). There is no trail lock — the floor keeps rising with every new high anchor. If the firm locks the trail (for example at starting balance + $100), the gate's floor will be stricter than the firm's after that point. Note this in the Manifest.
-- **Only anchors move the floor.** Intraday equity never moves it.
-- **Size ladder is hard-coded** by today's P&L since the anchor: below $1,000 → max 5; $1,000–$1,999.99 → max 10; $2,000 and up → max 20. A bigger order is resized down, not blocked. There is no separate max-contracts cap — if the firm's max is below 20, the gate can let through more than the firm allows.
+- **Drawdown floor, by `DD_MODE`:**
+  - `eod_trail`: floor = highest anchor − `DD_AMOUNT`. Only anchors move it.
+  - `intraday_trail`: floor = highest equity the gate has seen in any alert (entry, exit or anchor) − `DD_AMOUNT`. **The gate only sees equity when an alert fires. The firm sees every tick.** A run-up that reverses before the next fill raises the firm's floor but not the gate's. So for intraday-trail firms the gate's floor can be lower (looser) than the real one. Use a bigger `HAIRCUT_PCT` to cover this, and say so in the Manifest.
+  - `static`: floor = `START_BALANCE` − `DD_AMOUNT`. Never moves.
+  - `TRAIL_LOCK_BALANCE`: for the two trailing modes, the floor stops rising at this balance.
+  - Entries are blocked at floor + `DD_AMOUNT` × `HAIRCUT_PCT`/100.
+- **Anchors are still needed in every mode.** The daily cap (and the ladder when `LADDER_BASIS=day`) measure from today's anchor.
+- **Size ladder (`LADDER_CONFIG`):** the cap is the one for the highest threshold at or below the P&L. P&L below the first threshold gets the first cap. A bigger order is resized down, not blocked. The last cap is the most the gate ever sends — there is no other max-contracts check.
 - **Daily cap:** blocks entries once today's P&L ≤ −`DAILY_CAP_AMOUNT`.
 - **Entry cutoff:** blocks entries from `ENTRY_CUTOFF_ET` until `ENTRY_RESUME_ET` every day, weekends included. It never closes positions.
 - **Exits:** any order ID that is not in `ENTRY_ORDER_IDS` and not `EODAnchor` is forwarded with no checks. There is no exit ID list. So an entry ID that is misspelled in Railway is treated as an exit and goes straight to the broker.
 - **Fail-closed:** if an entry payload is missing equity or qty, the entry is blocked and Telegram says "fail-closed".
 - **Bad JSON:** dropped, logged to the Railway console only, no Telegram message.
 - **Telegram down:** the gate keeps working but sends no alert, and only the Railway console shows the error.
-- **State:** rebuilt from the ANCHOR rows in `LOG_PATH` on every start. Lose the log, lose the floor.
-- **`/health`:** returns `eod_hwm` and `day_anchor` only. No config hash.
+- **State:** rebuilt from `LOG_PATH` on every start — anchors from ANCHOR rows, the intraday peak from the equity column of every row. Exits are logged as PASS rows. Lose the log, lose the floor.
+- **`/health`:** returns `dd_mode`, `floor`, `eod_hwm`, `peak`, `day_anchor`, `trail_lock`, `ladder`, `ladder_basis`. No config hash yet. Compare `dd_mode`, `trail_lock`, `ladder` and `ladder_basis` against the Manifest at every recheck.
 
 ---
 
@@ -152,7 +162,7 @@ Use these when you fill the Manifest's "code/config value" column.
 - If Railway, the Manifest, and the code don't all match: stop, don't trade.
 - Never paste a customer's token, webhook URL, secret path, or account ID in chat or in a report.
 - Never reuse anything from another customer's service, Manifest, or logs.
-- Before every push: new variables are set in Railway first, the Manifest is updated, local tests are run, and the rollback commit is known.
+- Before every push: new variables are set in Railway first, the Manifest is updated, local tests are run (`python -m unittest discover -s tests`), and the rollback commit is known.
 
 ## Report
 Save to `claude/cowork-report-<customer>-<date>.md` after Marwan confirms the location.
