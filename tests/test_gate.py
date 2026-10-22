@@ -30,11 +30,15 @@ BASE_ENV = {
     # empty cutoff window, so tests pass at any time of day
     "ENTRY_CUTOFF_ET": "00:00",
     "ENTRY_RESUME_ET": "00:00",
+    # v3.1: these have no defaults any more
+    "DD_MODE": "eod_trail",
+    "LADDER_CONFIG": "0:5,1000:10,2000:20",
 }
 
 ALL_KEYS = set(BASE_ENV) | {
     "DD_MODE", "TRAIL_LOCK_BALANCE", "LADDER_CONFIG", "LADDER_BASIS",
     "LOG_PATH", "ID_FIELD", "EOD_ANCHOR_ID", "ENTRY_CUTOFF_TZ",
+    "STATE_PATH", "MAX_CONTRACTS",
 }
 
 
@@ -48,13 +52,16 @@ class SyncThread:
 
 
 class GateTest(unittest.TestCase):
-    def load(self, log_path=None, **env):
+    def load(self, log_path=None, state_path=None, **env):
         for k in ALL_KEYS:
             os.environ.pop(k, None)
         os.environ.update(BASE_ENV)
         if log_path is None:
             log_path = pathlib.Path(self.tmp.name) / "decisions.csv"
         os.environ["LOG_PATH"] = str(log_path)
+        if state_path is None:
+            state_path = pathlib.Path(self.tmp.name) / "state.json"
+        os.environ["STATE_PATH"] = str(state_path)
         os.environ.update({k: str(v) for k, v in env.items()})
         sys.modules.pop("app", None)
         mod = importlib.import_module("app")
@@ -83,7 +90,7 @@ class GateTest(unittest.TestCase):
         return self.client.get("/health").get_json()
 
     # ------------------------------------------------------------ DD_MODE
-    def test_default_mode_is_eod_trail(self):
+    def test_eod_trail_mode_reported(self):
         self.load()
         self.assertEqual(self.health()["dd_mode"], "eod_trail")
 
@@ -185,6 +192,129 @@ class GateTest(unittest.TestCase):
         self.load()
         r = self.client.post("/testpath", data=json.dumps(
             {"order_id": "Long", "quantity": 1}))
+        self.assertFalse(r.get_json()["ok"])
+        self.assertEqual(self.sent, [])
+
+    # ------------------------------------------------------------ v3.1: required variables
+    def test_missing_required_vars_stop_startup(self):
+        for name in ("START_BALANCE", "HAIRCUT_PCT", "DD_MODE", "LADDER_CONFIG",
+                     "ENTRY_CUTOFF_ET", "DD_AMOUNT", "DAILY_CAP_AMOUNT"):
+            with self.subTest(var=name), self.assertRaises(SystemExit) as cm:
+                self.load(**{name: ""})
+            self.assertIn(name, str(cm.exception))
+
+    def test_missing_state_path_stops_startup(self):
+        for k in ALL_KEYS:
+            os.environ.pop(k, None)
+        os.environ.update(BASE_ENV)
+        os.environ["LOG_PATH"] = str(pathlib.Path(self.tmp.name) / "d.csv")
+        sys.modules.pop("app", None)
+        with self.assertRaises(SystemExit):
+            importlib.import_module("app")
+
+    # ------------------------------------------------------------ v3.1: state file (Test 9)
+    def test_state_file_written_on_anchor(self):
+        st = pathlib.Path(self.tmp.name) / "state.json"
+        self.load(state_path=st)
+        self.post("EODAnchor", 50900)
+        d = json.loads(st.read_text())
+        self.assertEqual((d["day_anchor"], d["eod_hwm"]), (50900, 50900))
+        self.assertTrue(d["anchor_time"])
+
+    def test_restart_keeps_hwm_anchor_and_anchor_time(self):
+        log = pathlib.Path(self.tmp.name) / "decisions.csv"
+        self.load(log_path=log)
+        self.post("EODAnchor", 51200)
+        before = self.health()
+        self.load(log_path=log)                          # "restart"
+        after = self.health()
+        for k in ("eod_hwm", "day_anchor", "anchor_time", "floor"):
+            self.assertEqual(before[k], after[k], k)
+        self.assertEqual(after["state_source"], "state file + log")
+
+    def test_restart_with_state_file_only(self):
+        """Log lost, state file kept: floor must not reset."""
+        st = pathlib.Path(self.tmp.name) / "state.json"
+        log1 = pathlib.Path(self.tmp.name) / "a.csv"
+        self.load(log_path=log1, state_path=st)
+        self.post("EODAnchor", 51500)
+        log2 = pathlib.Path(self.tmp.name) / "empty.csv"
+        self.load(log_path=log2, state_path=st)
+        h = self.health()
+        self.assertEqual((h["eod_hwm"], h["floor"]), (51500, 49500))
+
+    def test_broken_state_file_falls_back_to_log(self):
+        st = pathlib.Path(self.tmp.name) / "state.json"
+        log = pathlib.Path(self.tmp.name) / "decisions.csv"
+        self.load(log_path=log, state_path=st)
+        self.post("EODAnchor", 50800)
+        st.write_text("{not json")
+        self.load(log_path=log, state_path=st)
+        h = self.health()
+        self.assertEqual(h["day_anchor"], 50800)
+        self.assertEqual(h["state_source"], "log (state file broken)")
+
+    def test_hwm_never_goes_down_on_restart(self):
+        """Test 8 on restart: a lower state file can't lower the HWM."""
+        st = pathlib.Path(self.tmp.name) / "state.json"
+        log = pathlib.Path(self.tmp.name) / "decisions.csv"
+        self.load(log_path=log, state_path=st)
+        self.post("EODAnchor", 51000)
+        self.post("EODAnchor", 50500)                    # losing day
+        st.write_text(json.dumps(dict(eod_hwm=50000, day_anchor=50500,
+                                      peak=50000, anchor_time="2000-01-01")))
+        self.load(log_path=log, state_path=st)
+        h = self.health()
+        self.assertEqual(h["eod_hwm"], 51000)
+        self.assertEqual(h["day_anchor"], 50500)
+
+    # ------------------------------------------------------------ v3.1: /health + hash
+    def test_health_has_rev7_fields(self):
+        self.load(PMT_WEBHOOK_URL="https://httpbin.org/post")
+        h = self.health()
+        for k in ("ok", "eod_hwm", "day_anchor", "anchor_time", "dd_mode",
+                  "dd_amount", "start_balance", "config_hash", "pmt_host"):
+            self.assertIn(k, h)
+        self.assertEqual(h["pmt_host"], "httpbin.org")
+        self.assertEqual((h["dd_amount"], h["start_balance"]), (2000, 50000))
+
+    def test_config_hash_matches_manifest_tool(self):
+        import gate_config
+        self.load()
+        manifest = dict(BASE_ENV, DD_AMOUNT="2000.0", START_BALANCE=" 50000 ")
+        self.assertEqual(self.health()["config_hash"], gate_config.config_hash(manifest))
+
+    def test_config_hash_changes_with_a_rule(self):
+        self.load()
+        h1 = self.health()["config_hash"]
+        self.load(DAILY_CAP_AMOUNT="300")
+        self.assertNotEqual(h1, self.health()["config_hash"])
+
+    def test_config_hash_ignores_secrets(self):
+        self.load(TELEGRAM_TOKEN="a")
+        h1 = self.health()["config_hash"]
+        self.load(TELEGRAM_TOKEN="b", SECRET_PATH="testpath")
+        self.assertEqual(h1, self.health()["config_hash"])
+
+    # ------------------------------------------------------------ v2.1 fixes carried in
+    def test_max_contracts_lowers_cap(self):
+        self.load(MAX_CONTRACTS="1")
+        self.post("Long", 50100, qty=3)
+        self.assertEqual(self.sent[-1]["quantity"], 1)
+
+    def test_overnight_cutoff_window(self):
+        import datetime as dt
+        from zoneinfo import ZoneInfo
+        mod = self.load(ENTRY_CUTOFF_ET="15:30", ENTRY_RESUME_ET="09:30")
+        tz = ZoneInfo("America/New_York")
+        at = lambda h, m: dt.datetime(2026, 10, 22, h, m, tzinfo=tz)
+        self.assertTrue(mod.past_entry_cutoff(at(16, 0)))
+        self.assertTrue(mod.past_entry_cutoff(at(2, 0)))
+        self.assertFalse(mod.past_entry_cutoff(at(10, 0)))
+
+    def test_non_object_json_dropped(self):
+        self.load()
+        r = self.client.post("/testpath", data="29400")
         self.assertFalse(r.get_json()["ok"])
         self.assertEqual(self.sent, [])
 

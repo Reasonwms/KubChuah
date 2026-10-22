@@ -51,9 +51,9 @@ If any item is missing, report Blocked and stop.
     - `MAX_EQUITY_DRIFT` check
     - News blackout
 
-    As of v3: `DD_MODE` and `LADDER_CONFIG` are **Built**. The other four are **NOT BUILT**. If the deployed service is still v2, report all six NOT BUILT and serve EOD-trail firms only.
+    As of v3.1: state file, `DD_MODE`, `LADDER_CONFIG` and the config hash are **Built**. `MAX_EQUITY_DRIFT` and news blackout are **NOT BUILT**. If the deployed service is still v2, report all six NOT BUILT and serve EOD-trail firms only.
 11. Create a new Railway service for this customer. Paid plan. Start command uses exactly 1 worker: `gunicorn app:app --workers 1` (already set in `railway.json` and `Procfile` — confirm it was not changed).
-12. Add a volume at `/data`. Set `LOG_PATH=/data/decisions.csv`. Also set `STATE_PATH=/data/state.json` so it is ready, but mark it "not read by code" in the Manifest until state persistence is built.
+12. Add a volume at `/data`. Set `LOG_PATH=/data/decisions.csv`. Set `STATE_PATH=/data/state.json` (v3.1 reads it; the service will not start without it).
 13. Set the non-secret Railway variables from this customer's Part A facts only. Use the variable table in Code facts. **Set every variable explicitly, even ones with a code default** — the defaults were written for one Legends Trading account, not for this customer.
 14. **Secrets.** The customer types these directly into Railway and PickMyTrade. Cowork only confirms they are present, never their values:
     - `TELEGRAM_TOKEN`
@@ -93,7 +93,7 @@ Write the results to the report. **Stop here.** Go-live needs Marwan's and the c
 
 ## Part E — Go live and daily (Customer approves; Marwan watches)
 23. Back up `decisions.csv` (and `state.json` once it exists).
-24. Recheck: Manifest = Railway = `/health`. Until a config hash is built, compare by hand: every Railway variable against the Manifest, and `/health` `day_anchor` / `eod_hwm` against the last ANCHOR row in the log.
+24. Recheck: Manifest = Railway = `/health`. Run `python gate_config.py manifest.env` on the Manifest values; the printed hash must equal `/health` `config_hash`. Also compare `/health` `day_anchor` / `eod_hwm` / `anchor_time` against the last ANCHOR row in the log.
 25. Customer points PickMyTrade at the real firm account and sets the real `PMT_WEBHOOK_URL`.
 26. Post the first anchor from strategy equity.
 27. Marwan watches the first three live signals by hand.
@@ -122,19 +122,20 @@ Use these when you fill the Manifest's "code/config value" column.
 | `DAILY_CAP_AMOUNT` | Required | — | KubChuah's own daily loss cap |
 | `QTY_FIELD` | Required | — | PickMyTrade key for contract count |
 | `ENTRY_ORDER_IDS` | Required | — | Comma list of entry IDs, exact case |
-| `START_BALANCE` | Set it | `50000` | Starting balance before first anchor |
-| `HAIRCUT_PCT` | Set it | `20` | % of drawdown buffer held back |
+| `START_BALANCE` | Required | — | Starting balance before first anchor |
+| `HAIRCUT_PCT` | Required | — | % of drawdown buffer held back |
 | `ID_FIELD` | Set it | `order_id` | Payload key for order ID |
 | `EOD_ANCHOR_ID` | Set it | `EODAnchor` | Order ID of the daily anchor alert |
-| `ENTRY_CUTOFF_ET` | Set it | `16:50` | No new entries from this time |
+| `ENTRY_CUTOFF_ET` | Required | — | No new entries from this time |
 | `ENTRY_RESUME_ET` | Set it | `18:00` | Entries allowed again from this time |
 | `ENTRY_CUTOFF_TZ` | Set it | `America/New_York` | Time zone for cutoff/resume |
-| `DD_MODE` | Set it | `eod_trail` | `eod_trail`, `intraday_trail` or `static`. Anything else = service won't start |
+| `DD_MODE` | Required | — | `eod_trail`, `intraday_trail` or `static`. Anything else = service won't start |
 | `TRAIL_LOCK_BALANCE` | Set it if firm locks | blank (no lock) | Trailing floor never rises above this balance. Ignored for `static` |
-| `LADDER_CONFIG` | Set it | `0:5,1000:10,2000:20` | `threshold:cap` tiers, ascending. Bad format = service won't start |
+| `LADDER_CONFIG` | Required | — | `threshold:cap` tiers, ascending. Bad format = service won't start |
 | `LADDER_BASIS` | Set it | `day` | `day` = P&L since today's anchor; `total` = equity − START_BALANCE |
-| `LOG_PATH` | Set it | `decisions.csv` (lost on redeploy) | Decision log — also the gate's memory |
-| `STATE_PATH` | Not read | — | Reserved for Rev 7 state file |
+| `LOG_PATH` | Required | — | Decision log — also the gate's memory |
+| `STATE_PATH` | Required | — | State file, e.g. `/data/state.json` (HWM, peak, anchor, anchor time) |
+| `MAX_CONTRACTS` | Set it | `0` (off) | Hard size limit on top of the ladder |
 | `MAX_EQUITY_DRIFT`, news blackout | Not read | — | NOT BUILT — manual rules only |
 
 ### How the gate behaves
@@ -152,8 +153,8 @@ Use these when you fill the Manifest's "code/config value" column.
 - **Fail-closed:** if an entry payload is missing equity or qty, the entry is blocked and Telegram says "fail-closed".
 - **Bad JSON:** dropped, logged to the Railway console only, no Telegram message.
 - **Telegram down:** the gate keeps working but sends no alert, and only the Railway console shows the error.
-- **State:** rebuilt from `LOG_PATH` on every start — anchors from ANCHOR rows, the intraday peak from the equity column of every row. Exits are logged as PASS rows. Lose the log, lose the floor.
-- **`/health`:** returns `dd_mode`, `floor`, `eod_hwm`, `peak`, `day_anchor`, `trail_lock`, `ladder`, `ladder_basis`. No config hash yet. Compare `dd_mode`, `trail_lock`, `ladder` and `ladder_basis` against the Manifest at every recheck.
+- **State:** saved to `STATE_PATH` after every change and also rebuilt from `LOG_PATH` on start. The gate keeps the higher HWM and peak and the newer anchor from the two. A broken state file falls back to the log and sends a Telegram warning. Lose both, lose the floor.
+- **`/health`:** returns `version`, `config_hash`, `dd_mode`, `dd_amount`, `start_balance`, `floor`, `eod_hwm`, `peak`, `day_anchor`, `anchor_time`, `trail_lock`, `ladder`, `ladder_basis`, `max_contracts`, `pmt_host`, `state_source`. `config_hash` must equal the hash of the signed Manifest. `pmt_host` must be `httpbin.org` until go-live.
 
 ---
 
