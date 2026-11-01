@@ -34,7 +34,7 @@ BASE_ENV = {
 
 ALL_KEYS = set(BASE_ENV) | {
     "DD_MODE", "TRAIL_LOCK_BALANCE", "LADDER_CONFIG", "LADDER_BASIS",
-    "LOG_PATH", "ID_FIELD", "EOD_ANCHOR_ID", "ENTRY_CUTOFF_TZ",
+    "LOG_PATH", "ID_FIELD", "EOD_ANCHOR_ID", "ENTRY_CUTOFF_TZ", "MAX_CONTRACTS",
 }
 
 
@@ -170,6 +170,31 @@ class GateTest(unittest.TestCase):
     def test_bad_ladder_basis_stops_startup(self):
         with self.assertRaises(SystemExit):
             self.load(LADDER_BASIS="week")
+
+    # ------------------------------------------------------------ v2.1 changes
+    def test_max_contracts_lowers_ladder_cap(self):
+        self.load(LADDER_CONFIG="0:5,1000:10", MAX_CONTRACTS="1")
+        r = self.post("Long", 50200, qty=3)
+        self.assertEqual(r["decision"], "RESIZE")
+        self.assertEqual(self.sent[-1]["quantity"], 1)
+        self.assertEqual(self.health()["max_contracts"], 1)
+
+    def test_overnight_cutoff_window(self):
+        import datetime
+        from zoneinfo import ZoneInfo
+        mod = self.load(ENTRY_CUTOFF_ET="15:30", ENTRY_RESUME_ET="09:30")
+        ny = ZoneInfo("America/New_York")
+        at = lambda h, m: datetime.datetime(2026, 11, 2, h, m, tzinfo=ny)
+        self.assertFalse(mod.past_entry_cutoff(at(10, 0)))
+        self.assertTrue(mod.past_entry_cutoff(at(15, 30)))
+        self.assertTrue(mod.past_entry_cutoff(at(20, 0)))
+        self.assertTrue(mod.past_entry_cutoff(at(9, 29)))
+
+    def test_non_object_json_dropped(self):
+        self.load()
+        r = self.client.post("/testpath", data="29400")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.sent, [])
 
     # ------------------------------------------------------------ unchanged rules
     def test_daily_cap_blocks(self):

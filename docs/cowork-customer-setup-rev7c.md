@@ -37,7 +37,7 @@ If any item is missing, report Blocked and stop.
 - Trail lock is missing (write "none" if the firm has no lock — blank is not allowed).
 - Drawdown type is not one of: intraday trail, EOD trail, static.
 - DAILY_CAP_AMOUNT is higher than the firm's daily loss limit (if the firm has one).
-- The last cap in LADDER_CONFIG is higher than the firm's max contracts.
+- `MAX_CONTRACTS` is blank, or higher than the firm's max contracts.
 - No written OK on automation from the firm.
 
 ---
@@ -60,7 +60,7 @@ If any item is missing, report Blocked and stop.
     - `SECRET_PATH` (the webhook secret path — a long random string)
     - `PMT_WEBHOOK_URL` and the PickMyTrade token / account ID inside the customer's JSON
 15. **Variable Manifest.** One page, three columns per setting: customer fact | Railway value | code/config value. Secrets show "present / missing" only.
-    - Map the firm facts like this: drawdown type intraday trail → `DD_MODE=intraday_trail`, EOD trail → `eod_trail`, static → `static`. Trail lock level → `TRAIL_LOCK_BALANCE` (blank if "none"). Max drawdown → `DD_AMOUNT`. Starting balance → `START_BALANCE`. Max contracts ≥ last cap in `LADDER_CONFIG`.
+    - Map the firm facts like this: drawdown type intraday trail → `DD_MODE=intraday_trail`, EOD trail → `eod_trail`, static → `static`. Trail lock level → `TRAIL_LOCK_BALANCE` (blank if "none"). Max drawdown → `DD_AMOUNT`. Starting balance → `START_BALANCE`. Firm max contracts (or the customer's own lower limit) → `MAX_CONTRACTS`.
     - Include every variable in the Code facts table, plus every Part A fact that has no variable (mark those "manual rule — not enforced by gate").
     - Customer signs it. Marwan signs it.
     - No tests and no go-live without both signatures and all three columns matching.
@@ -73,7 +73,7 @@ If any item is missing, report Blocked and stop.
     - Start from the customer's PickMyTrade JSON.
     - Add `"order_id": "{{strategy.order.id}}"` (or the customer's ID key — it must match `ID_FIELD`).
     - Add `"equity": {{strategy.equity}}` (no quotes).
-    - Set the action field to `"{{strategy.order.action}}"`, never a fixed value.
+    - Action field: with the **Order fills** trigger, use `"{{strategy.order.action}}"`. If the Pine script builds its own JSON with `alert()`, the placeholder does **not** work there — the script must send a fixed `"data":"buy"` / `"data":"close"`. Check which type the customer uses.
     - Trigger = Order fills. Webhook = gate URL + `/` + secret path.
     - Show the JSON with all secrets redacted. Do not edit the Pine script.
     - Confirm the order IDs the Pine script actually sends match `ENTRY_ORDER_IDS` letter for letter. **A typo here means entries pass through the gate unchecked** (see Code facts).
@@ -127,7 +127,8 @@ Use these when you fill the Manifest's "code/config value" column.
 | `ID_FIELD` | Set it | `order_id` | Payload key for order ID |
 | `EOD_ANCHOR_ID` | Set it | `EODAnchor` | Order ID of the daily anchor alert |
 | `ENTRY_CUTOFF_ET` | Set it | `16:50` | No new entries from this time |
-| `ENTRY_RESUME_ET` | Set it | `18:00` | Entries allowed again from this time |
+| `ENTRY_RESUME_ET` | Set it | `18:00` | Entries allowed again from this time. Earlier than the cutoff = block runs overnight (e.g. 15:30 → 09:30) |
+| `MAX_CONTRACTS` | Set it | `0` (off) | Hard size limit on top of the ladder. Not a whole number = service won't start |
 | `ENTRY_CUTOFF_TZ` | Set it | `America/New_York` | Time zone for cutoff/resume |
 | `DD_MODE` | Set it | `eod_trail` | `eod_trail`, `intraday_trail` or `static`. Anything else = service won't start |
 | `TRAIL_LOCK_BALANCE` | Set it if firm locks | blank (no lock) | Trailing floor never rises above this balance. Ignored for `static` |
@@ -145,9 +146,10 @@ Use these when you fill the Manifest's "code/config value" column.
   - `TRAIL_LOCK_BALANCE`: for the two trailing modes, the floor stops rising at this balance.
   - Entries are blocked at floor + `DD_AMOUNT` × `HAIRCUT_PCT`/100.
 - **Anchors are still needed in every mode.** The daily cap (and the ladder when `LADDER_BASIS=day`) measure from today's anchor.
-- **Size ladder (`LADDER_CONFIG`):** the cap is the one for the highest threshold at or below the P&L. P&L below the first threshold gets the first cap. A bigger order is resized down, not blocked. The last cap is the most the gate ever sends — there is no other max-contracts check.
+- **Size ladder (`LADDER_CONFIG`):** the cap is the one for the highest threshold at or below the P&L. P&L below the first threshold gets the first cap. A bigger order is resized down, not blocked. `MAX_CONTRACTS` then lowers the cap if it is set above 0.
 - **Daily cap:** blocks entries once today's P&L ≤ −`DAILY_CAP_AMOUNT`.
-- **Entry cutoff:** blocks entries from `ENTRY_CUTOFF_ET` until `ENTRY_RESUME_ET` every day, weekends included. It never closes positions.
+- **Entry cutoff:** blocks entries from `ENTRY_CUTOFF_ET` until `ENTRY_RESUME_ET`, every day, weekends included. If resume is earlier than cutoff, the block crosses midnight (no evening entries). If overnight is not allowed, use the overnight form. It never closes positions.
+- **Non-object JSON** (e.g. a bare price like `29400`): dropped, nothing forwarded.
 - **Exits:** any order ID that is not in `ENTRY_ORDER_IDS` and not `EODAnchor` is forwarded with no checks. There is no exit ID list. So an entry ID that is misspelled in Railway is treated as an exit and goes straight to the broker.
 - **Fail-closed:** if an entry payload is missing equity or qty, the entry is blocked and Telegram says "fail-closed".
 - **Bad JSON:** dropped, logged to the Railway console only, no Telegram message.

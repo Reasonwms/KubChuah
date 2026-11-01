@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KubChuah Gate — v3 (DD_MODE + LADDER_CONFIG)
+KubChuah Gate — v3 (DD_MODE + LADDER_CONFIG, on top of v2.1)
 CDO Consulting LLC / ATI Division
 
 Sits between TradingView and PickMyTrade.
@@ -24,7 +24,11 @@ CHANGES FROM v2 (one firm, hard-coded rules):
   since today's anchor, same as v2) or "total" (equity - START_BALANCE).
 - Exits are now logged as PASS rows with their equity, so the
   intraday_trail peak survives a restart (rebuilt from the log).
-- /health now reports dd_mode, floor, peak, ladder and ladder_basis.
+- /health now reports dd_mode, floor, peak, ladder, ladder_basis and
+  max_contracts.
+- Keeps all three v2.1 changes below (midnight cutoff window,
+  MAX_CONTRACTS, non-object JSON guard). MAX_CONTRACTS still lowers
+  whatever cap LADDER_CONFIG gives.
 
 CHANGES FROM v1 (Apex / intraday trailing):
 - Drawdown floor now trails on END-OF-DAY balance only, not on every
@@ -44,6 +48,24 @@ CHANGES FROM v1 (Apex / intraday trailing):
   overnight-positions rule. This does NOT close open positions — it
   only stops new ones from opening late. Flattening before the session
   ends is still on the trader (or the firm's own auto-liquidation).
+
+CHANGES IN v2.1 (2026-10-21) — three changes only:
+1. past_entry_cutoff() now supports a block window that crosses midnight.
+   WHY: with ENTRY_CUTOFF_ET=15:30 and ENTRY_RESUME_ET=09:30, the old test
+   (cutoff <= now < resume) could never be true, so the time block was OFF.
+   NOW: if cutoff <= resume -> blocked when cutoff <= now < resume (same as
+   before, so 16:50 / 18:00 behaves exactly as it did).
+   If cutoff > resume -> blocked when now >= cutoff OR now < resume
+   (the overnight case, e.g. 15:30 -> 09:30 next day).
+2. New optional variable MAX_CONTRACTS. When set to a number above 0, the
+   ladder cap is lowered to this number (cap = min(ladder cap, MAX_CONTRACTS)).
+   WHY: the practice account rule is 1 contract, but the ladder is coded as
+   5 / 10 / 20. Not set (or 0) = old behaviour, ladder only.
+   A value that is not a whole number stops the app at startup (fail loud).
+3. Guard for alerts that are valid JSON but not a JSON object (for example
+   a bare number like 29400). They are now dropped like unparseable alerts,
+   with a 200 reply, instead of crashing with a 500. Nothing is forwarded.
+   WHY: price alerts pointed at the gate crashed payload.get() (line 181).
 """
 import os, csv, json, pathlib, threading, datetime
 from zoneinfo import ZoneInfo
@@ -64,6 +86,9 @@ QTY_FIELD = os.environ["QTY_FIELD"]
 ENTRY_IDS = [s.strip() for s in os.environ["ENTRY_ORDER_IDS"].split(",")]
 ID_FIELD = os.environ.get("ID_FIELD", "order_id")
 EOD_ANCHOR_ID = os.environ.get("EOD_ANCHOR_ID", "EODAnchor")
+
+# v2.1 change 2: optional hard size limit on top of the ladder. 0 = off.
+MAX_CONTRACTS = int(os.environ.get("MAX_CONTRACTS", "0") or "0")
 
 # Entry cutoff: "HH:MM" in the given timezone. No new entries at/after this.
 # Legends Trading requires positions closed by ~4:59pm ET. Default here is
@@ -162,6 +187,9 @@ def contract_cap(pnl):
     for lo, tier_cap in LADDER:
         if pnl >= lo:
             cap = tier_cap
+    # v2.1 change 2: MAX_CONTRACTS lowers the cap when set
+    if MAX_CONTRACTS > 0:
+        cap = min(cap, MAX_CONTRACTS)
     return cap
 
 def trail_high():
@@ -183,13 +211,17 @@ def see_equity(equity):
     global PEAK
     PEAK = max(PEAK, equity)
 
-def past_entry_cutoff():
-    now_et = datetime.datetime.now(ZoneInfo(ENTRY_CUTOFF_TZ))
+def past_entry_cutoff(now_et=None):
+    if now_et is None:
+        now_et = datetime.datetime.now(ZoneInfo(ENTRY_CUTOFF_TZ))
     cutoff_h, cutoff_m = (int(x) for x in ENTRY_CUTOFF_ET.split(":"))
     resume_h, resume_m = (int(x) for x in ENTRY_RESUME_ET.split(":"))
     cutoff = now_et.replace(hour=cutoff_h, minute=cutoff_m, second=0, microsecond=0)
     resume = now_et.replace(hour=resume_h, minute=resume_m, second=0, microsecond=0)
-    return cutoff <= now_et < resume
+    # v2.1 change 1: support a block window that crosses midnight
+    if cutoff <= resume:
+        return cutoff <= now_et < resume          # same-day block (e.g. 16:50 -> 18:00)
+    return now_et >= cutoff or now_et < resume    # overnight block (e.g. 15:30 -> 09:30)
 
 def evaluate(equity, qty_in):
     """Returns (decision, qty_out, reason, floor, day_pnl, buffer_pct)."""
@@ -257,6 +289,11 @@ def gate():
         payload = json.loads(raw)
     except Exception:
         print("unparseable payload:", raw[:400])
+        return jsonify(ok=False), 200
+
+    # v2.1 change 3: valid JSON that is not an object (e.g. a bare number) is dropped
+    if not isinstance(payload, dict):
+        print("non-object payload dropped:", raw[:400])
         return jsonify(ok=False), 200
 
     order_id = str(payload.get(ID_FIELD, ""))
@@ -335,6 +372,7 @@ def health():
     return jsonify(ok=True, dd_mode=DD_MODE, floor=round(hard_floor(), 2),
                    eod_hwm=EOD_HWM, peak=PEAK, day_anchor=DAY_ANCHOR,
                    trail_lock=TRAIL_LOCK_BALANCE, ladder=LADDER,
+                   max_contracts=MAX_CONTRACTS,
                    ladder_basis=LADDER_BASIS), 200
 
 if __name__ == "__main__":
